@@ -1,0 +1,196 @@
+stages:
+  - verify
+  - build
+  - deploy
+  - post-deploy
+
+# Джоб запускается при создании
+verify-job:
+  stage: verify
+  tags: [win-ubs]
+  rules:
+    - if: '($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "preprod" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master") && $CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    # Выводим метки в лог
+    - Write-Host "CI_MERGE_REQUEST_LABELS=$env:CI_MERGE_REQUEST_LABELS"
+    - >
+      if (-not $env:CI_MERGE_REQUEST_LABELS) {
+        Write-Host "Ошибка: заполните метки"
+        exit 1
+      }
+
+# Джоб запускается после merge в ветку preprod
+build-job:
+  stage: build
+  tags: [win-ubs]
+  rules:
+    - if: '($CI_COMMIT_BRANCH == "preprod" || $CI_COMMIT_BRANCH == "master") && $CI_PIPELINE_SOURCE != "schedule"'
+  script:
+    - $env:PATH += ";$DEPLOY_TOOL_PATH"
+    # Получаем последний смёрженный MR
+    - |
+      $url = "$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests?state=merged&target_branch=$CI_COMMIT_BRANCH&order_by=updated_at&sort=desc"
+      $MR_JSON = curl.exe --header "PRIVATE-TOKEN: $CI_PROJECT_TOKEN" $url
+    
+    # Извлекаем метки
+    - |
+      $labels = ($MR_JSON | ConvertFrom-Json)[0].labels -join ";"
+      Write-Host "Метки: $labels"
+
+    # Формируем список действий opt:
+    - |
+      $options = $labels.Split(";") |
+        Where-Object { $_ -like "opt:*" } |
+        ForEach-Object { $_.Split(":")[1] } |
+        Where-Object { $_ -ne "" } |
+        Join-String -Separator ";"
+
+      Write-Host "Действия после установки пакетов: $options"
+      "OPTIONS='$options'" | Out-File -Encoding utf8 post-deploy.env
+
+    # Проверка на not-install-pkgs
+    - |
+      if ($options -like "*not-install-pkgs*") {
+        Write-Host "Найдена метка not-install-pkgs. Сборка пакетов пропускается"
+        exit 0
+      }
+ 
+    # Формируем список пакетов pkg:
+    - |
+      $packages = $labels.Split(";") |
+        Where-Object { $_ -like "pkg:*" } |
+        ForEach-Object { $_.Split(":")[1] } |
+        Where-Object { $_ -ne "" } |
+        Join-String -Separator ";"
+
+      Write-Host "Сборка пакетов: $packages"
+
+    # Архивация пакетов
+    - |
+      $pkgArray = $packages.Split(";")
+      foreach ($pkg in $pkgArray) {
+        if ($pkg) {
+          Write-Host "Архивируем пакет: $pkg"
+          ubs.exe zip $pkg
+        }
+      }
+
+    # Упаковка результата
+    - |
+      Write-Host "Упаковка сформированных пакетов."
+      Compress-Archive -Path *.gz -DestinationPath packages.zip -Force
+      Write-Host "Сборка пакетов завершена."
+  artifacts:
+    paths: 
+      - post-deploy.env
+      - packages.zip 
+    expire_in: 1 week 
+    when: always
+
+deploy-job:
+  stage: deploy
+  tags: [win-ubs]
+  rules:
+    - if: '($CI_COMMIT_BRANCH == "preprod" || $CI_COMMIT_BRANCH == "master") && $CI_PIPELINE_SOURCE != "schedule"'
+  dependencies:
+    - build-job
+  script:
+    - $env:PATH += ";$DEPLOY_TOOL_PATH"
+    # Загружаем переменные из post-deploy.env
+    - |
+      Write-Host "Загрузка переменных из post-deploy.env"
+      Get-Content post-deploy.env | ForEach-Object {
+        if ($_ -match "^(.*?)='(.*)'$") {
+          $name = $matches[1]
+          $value = $matches[2]
+          Set-Item -Path "env:$name" -Value $value
+        }
+      }
+      Write-Host "OPTIONS=$env:OPTIONS"
+
+    # Проверка на not-install-pkgs
+    - |
+      if ($env:OPTIONS -like "*not-install-pkgs*") {
+        Write-Host "Найдена метка not-install-pkgs. Установка пакетов пропускается"
+        exit 0
+      }
+
+    # Установка пакета
+    - |
+      Write-Host "Установка пакета: packages.zip на $BPMSOFT_URL"
+
+      ubs.exe install packages.zip `
+        -u $BPMSOFT_URL `
+        -l $BPMSOFT_USER `
+        -p $BPMSOFT_PASSWORD `
+        -i false 2>&1 |
+        Tee-Object -FilePath install.log
+
+    # Проверяем последнюю строку на Error
+    - |
+      $lastLine = Get-Content install.log | Select-Object -Last 1
+      Write-Host "Последняя строка лога: $lastLine"
+
+      if ($lastLine -match "Error") {
+        Write-Host "Установка завершилась ошибкой"
+        exit 1
+      }
+
+      Write-Host "Пакет успешно установлен."
+  environment:
+    name: $CI_COMMIT_BRANCH
+  artifacts:
+    paths: 
+      - post-deploy.env
+    expire_in: 1 week 
+    when: always
+
+post-job:
+  stage: post-deploy
+  tags: [win-ubs]
+  rules:
+    - if: '($CI_COMMIT_BRANCH == "preprod" || $CI_COMMIT_BRANCH == "master") && $CI_PIPELINE_SOURCE != "schedule"'
+  dependencies:
+    - deploy-job
+  script:
+    - $env:PATH += ";$DEPLOY_TOOL_PATH"
+    # Загружаем переменные из post-deploy.env
+    - |
+      Write-Host "Загрузка переменных из post-deploy.env"
+      Get-Content post-deploy.env | ForEach-Object {
+        if ($_ -match "^(.*?)='(.*)'$") {
+          $name = $matches[1]
+          $value = $matches[2]
+          Set-Item -Path "env:$name" -Value $value
+        }
+      }
+      Write-Host "OPTIONS=$env:OPTIONS"
+
+    # Выводим действия
+    - |
+      Write-Host "Действия после установки пакетов: $env:OPTIONS"
+
+    # Выполняем redis-clean
+    - |
+      if ($env:OPTIONS -like "*redis-clean*") {
+        Write-Host "Выполняем очистку Redis"
+        ubs.exe clear-redis `
+          -u $BPMSOFT_URL `
+          -l $BPMSOFT_USER `
+          -p $BPMSOFT_PASSWORD `
+          -i false
+      }
+
+    # Выполняем restart-app
+    - |
+      if ($env:OPTIONS -like "*restart-app*") {
+        Write-Host "Выполняем перезапуск приложения"
+        ubs.exe restart `
+          -u $BPMSOFT_URL `
+          -l $BPMSOFT_USER `
+          -p $BPMSOFT_PASSWORD `
+          -i false
+      }
+  environment:
+    name: $CI_COMMIT_BRANCH
+   
