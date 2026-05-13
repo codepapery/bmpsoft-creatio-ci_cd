@@ -1,0 +1,119 @@
+stages:
+  - verify
+  - auto-merge
+  - build
+  - deploy
+  - post-deploy
+
+# Джоб запускается при создании
+verify-job:
+  stage: verify
+  image:
+    name: ruby:3.3
+    pull_policy: if-not-present
+  rules:
+    - if: '($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "preprod" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master") && $CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    # Выводим метки в лог
+    - echo "CI_MERGE_REQUEST_LABELS=$CI_MERGE_REQUEST_LABELS"
+    - 'if [ -z "$CI_MERGE_REQUEST_LABELS" ]; then echo "Ошибка: заполните метки"; exit 1; fi'
+
+# Джоб запускается из pipeline schedule для запуска автоматического слияния открытого MR содержащего метку schedule
+auto-merge-job:
+  stage: auto-merge
+  image:
+    name: $CI_REGISTRY/bpmsoft/bpmsoft-deploy-image:latest
+    pull_policy: if-not-present
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  script:
+    - echo "Сборка проекта по расписанию"
+    # Получаем открытый MR с меткой opt:schedule
+    - 'MR_JSON=$(curl --silent --header "PRIVATE-TOKEN: $CI_PROJECT_TOKEN" "$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests?state=opened&labels=opt:schedule")'
+    # Получаем IID MR (внутренний ID в проекте) 
+    - MR_IID=$(echo "$MR_JSON" | jq '.[0].iid') 
+    - echo "MR_IID=$MR_IID"
+    # Если MR найден, запускаем merge
+    - 'if [ "$MR_IID" != "null" ]; then echo "Запускаем merge MR $MR_IID"; curl --request PUT --silent --header "PRIVATE-TOKEN: $CI_PROJECT_TOKEN" "$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests/$MR_IID/merge"; else echo "Нет открытых MR с меткой opt:schedule"; fi'
+
+# Джоб запускается после merge в ветку preprod
+build-job:
+  stage: build
+  image:
+    name: $CI_REGISTRY/bpmsoft/bpmsoft-deploy-image:latest
+    pull_policy: if-not-present
+  rules:
+    - if: '($CI_COMMIT_BRANCH == "preprod" || $CI_COMMIT_BRANCH == "master") && $CI_PIPELINE_SOURCE != "schedule"'
+  script:
+    # Получаем последний смёрженный MR для этой ветки
+    - 'MR_JSON=$(curl --header "PRIVATE-TOKEN: $CI_PROJECT_TOKEN" "$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests?state=merged&target_branch=$CI_COMMIT_BRANCH&order_by=updated_at&sort=desc")' 
+    
+    # Извлекаем метки из MR
+    - LABELS=$(echo "$MR_JSON" | jq -r '.[0].labels | join(";")')
+    - 'echo "Метки: $LABELS"'
+
+    # Формируем список действий после установки пакетов
+    - OPTIONS=$(echo "$LABELS" | tr ';' '\n' | awk -F':' '/^opt:/ {print $2}' | paste -sd ';' -)
+    - 'echo "Действия после установки пакетов: $OPTIONS"'
+    - echo "OPTIONS='$OPTIONS'" > post-deploy.env
+
+    - 'if [[ "$OPTIONS" == *"not-install-pkgs"* ]]; then echo "Найдена метка not-install-pkgs. Сборка пакетов пропускается"; exit 0; fi'
+ 
+    # Формируем список пакетов для сборки
+    - PACKAGES=$(echo "$LABELS" | tr ';' '\n' | awk -F':' '/^pkg:/ {print $2}' | paste -sd ';' -)
+    - 'echo "Сборка пакетов: $PACKAGES"'
+    - IFS=";" read -ra PKG_ARRAY <<< "$PACKAGES"
+    - 'for pkg in "${PKG_ARRAY[@]}"; do echo "Архивируем пакет: $pkg"; /usr/bin/ubs zip "$pkg"; done'
+    - echo "Упаковка сформированных пакетов."
+    - zip packages.zip *.gz
+    - echo "Сборка пакетов завершена."
+  artifacts:
+    paths: 
+      - post-deploy.env
+      - packages.zip 
+    expire_in: 1 week 
+    when: always
+
+deploy-job:
+  stage: deploy
+  image:
+    name: $CI_REGISTRY/bpmsoft/bpmsoft-deploy-image:latest
+    pull_policy: if-not-present
+  rules:
+    - if: '($CI_COMMIT_BRANCH == "preprod" || $CI_COMMIT_BRANCH == "master") && $CI_PIPELINE_SOURCE != "schedule"'
+  dependencies:
+    - build-job
+  script:
+    - source post-deploy.env
+    - 'if [[ "$OPTIONS" == *"not-install-pkgs"* ]]; then echo "Найдена метка not-install-pkgs. Установка пакетов пропускается"; exit 0; fi'
+    - 'echo "Установка пакетa: packages.zip на $BPMSOFT_URL"'
+    # Запускаем команду, выводим в консоль и сохраняем в файл
+    - /usr/bin/ubs install packages.zip -u "$BPMSOFT_URL" -l "$BPMSOFT_USER" -p "$BPMSOFT_PASSWORD" -i false 2>&1 | tee install.log
+    # Проверяем последнюю строку на Error
+    - LAST_LINE=$(tail -n 1 install.log)
+    - echo "$LAST_LINE" | grep -q "Error" && { echo "Установка завершилась ошибкой"; exit 1; }
+    - echo "Пакет успешно установлен."
+  environment:
+    name: $CI_COMMIT_BRANCH
+  artifacts:
+    paths: 
+      - post-deploy.env
+    expire_in: 1 week 
+    when: always
+
+post-job:
+  stage: post-deploy
+  image:
+    name: $CI_REGISTRY/bpmsoft/bpmsoft-deploy-image:latest
+    pull_policy: if-not-present
+  rules:
+    - if: '($CI_COMMIT_BRANCH == "preprod" || $CI_COMMIT_BRANCH == "master") && $CI_PIPELINE_SOURCE != "schedule"'
+  dependencies:
+    - deploy-job
+  script:
+    - source post-deploy.env
+    - 'echo "Действия после установки пакетов: $OPTIONS"'
+    - 'if [[ "$OPTIONS" == *"redis-clean"* ]]; then echo "Выполняем очистку Redis"; /usr/bin/ubs clear-redis -u $BPMSOFT_URL -l $BPMSOFT_USER -p $BPMSOFT_PASSWORD -i false; fi'
+    - 'if [[ "$OPTIONS" == *"restart-app"* ]]; then echo "Выполняем перезапуск приложения"; /usr/bin/ubs restart -u $BPMSOFT_URL -l $BPMSOFT_USER -p $BPMSOFT_PASSWORD -i false; fi'
+  environment:
+    name: $CI_COMMIT_BRANCH
