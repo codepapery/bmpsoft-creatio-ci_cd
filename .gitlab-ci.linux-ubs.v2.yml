@@ -1,0 +1,104 @@
+stages:
+  - build
+  - deploy
+  - post-deploy
+
+build-job:
+  stage: build
+  tags: [prod-runner]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+    - if: $CI_COMMIT_BRANCH == "develop"
+      when: manual
+    - when: never
+  script:
+    # Получаем последний смёрженный MR для этой ветки 
+    - ENCODED_PATH=$(echo -n "$CI_PROJECT_PATH" | sed 's/\//%2F/g')
+    - 'MR_JSON=$(curl --header "PRIVATE-TOKEN: $CI_PROJECT_TOKEN" "$CI_API_V4_URL/projects/$ENCODED_PATH/merge_requests?state=merged&target_branch=$CI_COMMIT_BRANCH&order_by=updated_at&sort=desc")'
+    # Получаем метку MR
+    - LABELS=$(echo "$MR_JSON" | grep -o '"labels":[[][^]]*]' | head -n1)
+    - echo "$LABELS"
+      # Проверяем наличие pkg: или opt:
+    - |
+      if echo "$LABELS" | grep -qE 'opt:'; then
+        OPTIONS=$(echo "$LABELS" | grep -o 'opt:[^"]*' | cut -d':' -f2 | paste -sd ';' -)
+        echo "Действия после установки пакетов: $OPTIONS"
+      fi
+    - echo "OPTIONS='$OPTIONS'" > post-deploy.env
+    - |
+      if [[ "$OPTIONS" == *"not-install-pkgs"* ]]; then 
+         echo "Найдена метка not-install-pkgs. Сборка пакетов пропускается"
+         exit 0
+      fi
+    - |
+      if ! echo "$LABELS" | grep -qE 'pkg:'; then
+        echo "Отсутствуют метки для установки пакетов"
+        exit 1
+      fi
+    # Формируем список пакетов для сборки
+    - PACKAGES=$(echo "$LABELS" | grep -o 'pkg:[^"]*' | cut -d':' -f2 | paste -sd ';' -)
+    - 'echo "Сборка пакетов: $PACKAGES"'
+    - IFS=";" read -ra PKG_ARRAY <<< "$PACKAGES"
+    - 'for pkg in "${PKG_ARRAY[@]}"; do echo "Архивируем пакет: $pkg"; dotnet /etc/ubs/ubs.dll zip "$pkg"; done'
+    - echo "Упаковка сформированных пакетов."
+    - zip packages.zip *.gz
+    - echo "Сборка пакетов завершена."
+  artifacts:
+    paths:
+      - post-deploy.env
+      - packages.zip
+    expire_in: 1 week
+    when: always
+  environment:
+    name: $CI_COMMIT_BRANCH
+
+deploy-job:
+  stage: deploy
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+  dependencies:
+    - build-job
+  script:
+    - source post-deploy.env
+    - |
+      if [[ "$OPTIONS" == *"not-install-pkgs"* ]]; then 
+        echo "Найдена метка not-install-pkgs. Установка пакетов пропускается"
+        exit 0
+      fi
+    - 'echo "Установка пакетa: packages.zip на $BPMSOFT_NODE1_URL"'
+    # Запускаем команду, выводим в консоль и сохраняем в файл
+    - dotnet /etc/ubs/ubs.dll install packages.zip -u "$BPMSOFT_NODE1_URL" -l "$BPMSOFT_USER" -p "$BPMSOFT_PASSWORD" -i false 2>&1 | tee install.log
+    # Проверяем последнюю строку на Error
+    - LAST_LINE=$(tail -n 1 install.log)
+    - echo "$LAST_LINE" | grep -q "Error" && { echo "Установка завершилась ошибкой"; exit 1; }
+    - echo "Пакет успешно установлен."
+  environment:
+    name: $CI_COMMIT_BRANCH
+  artifacts:
+    paths:
+      - post-deploy.env
+    expire_in: 1 week
+    when: always
+
+post-job:
+  stage: post-deploy
+  rules:
+  - if: $CI_COMMIT_BRANCH == "develop"
+  dependencies:
+    - deploy-job
+  script:
+    - source post-deploy.env
+    - 'echo "Действия после установки пакетов: $OPTIONS"'
+    - |
+      if [[ "$OPTIONS" == *"redis-clean"* ]]; then 
+        echo "Выполняем очистку Redis"; 
+        dotnet /etc/ubs/ubs.dll clear-redis -u $BPMSOFT_NODE1_URL -l $BPMSOFT_USER -p $BPMSOFT_PASSWORD -i false; 
+      fi
+    - |
+      if [[ "$OPTIONS" == *"restart-app"* ]]; then 
+        echo "Выполняем перезапуск приложения"; 
+        dotnet /etc/ubs/ubs.dll restart -u $BPMSOFT_NODE1_URL -l $BPMSOFT_USER -p $BPMSOFT_PASSWORD -i false; 
+      fi
+  environment:
+    name: $CI_COMMIT_BRANCH
